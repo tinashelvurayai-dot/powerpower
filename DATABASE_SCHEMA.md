@@ -1,0 +1,515 @@
+# Database Schema & RLS Policies - Complete Reference
+
+## Overview
+
+This document shows all the database tables, functions, and Row-Level Security (RLS) policies that were created to fix the permission errors and enable the admin dashboard to function properly.
+
+## 1. Database Enums
+
+```sql
+CREATE TYPE public.app_role AS ENUM ('admin', 'user');
+CREATE TYPE public.access_level AS ENUM ('free', 'full');
+CREATE TYPE public.ticket_status AS ENUM ('open', 'in_progress', 'closed');
+CREATE TYPE public.payment_status AS ENUM ('pending', 'approved', 'rejected');
+```
+
+These enums ensure type safety for roles, access levels, and statuses throughout the application.
+
+---
+
+## 2. Core Tables
+
+### Profiles Table
+Stores user profile information and access level.
+
+```sql
+CREATE TABLE public.profiles (
+  id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  full_name TEXT,
+  mobile_number TEXT,
+  access_level public.access_level NOT NULL DEFAULT 'free',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+```
+
+**Purpose**: Central user information store. Each user gets one profile on signup.
+
+### User Roles Table
+Manages role assignments (admin vs regular user).
+
+```sql
+CREATE TABLE public.user_roles (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  role public.app_role NOT NULL,
+  UNIQUE (user_id, role)
+);
+ALTER TABLE public.user_roles ENABLE ROW LEVEL SECURITY;
+```
+
+**Purpose**: Determines if a user is an admin or regular user.
+
+### Access Requests Table
+Stores requests from users wanting full access.
+
+```sql
+CREATE TABLE public.access_requests (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  user_email TEXT NOT NULL,
+  full_name TEXT,
+  email TEXT,
+  whatsapp TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  generated_code TEXT,
+  synthetic_email TEXT,
+  auto_password TEXT,
+  approved_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE public.access_requests ENABLE ROW LEVEL SECURITY;
+```
+
+**Purpose**: Admins review these requests, approve them, and generate codes for users.
+
+### Access Codes Table
+Redeemable codes that grant full access to the platform.
+
+```sql
+CREATE TABLE public.access_codes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  code TEXT NOT NULL UNIQUE,
+  total_seats INT NOT NULL DEFAULT 1,
+  used_seats INT NOT NULL DEFAULT 0,
+  amount NUMERIC(10,2) NOT NULL DEFAULT 5,
+  agent_name TEXT,
+  assigned_emails TEXT[] DEFAULT '{}',
+  bound_user_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  notes TEXT
+);
+ALTER TABLE public.access_codes ENABLE ROW LEVEL SECURITY;
+```
+
+**Purpose**: Tracks access codes - how many seats, who can use them, expiration.
+
+### Access Code Usage Table
+Logs when codes are redeemed.
+
+```sql
+CREATE TABLE public.access_code_usage (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  code_id UUID NOT NULL REFERENCES public.access_codes(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  user_email TEXT NOT NULL,
+  used_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (code_id, user_id)
+);
+ALTER TABLE public.access_code_usage ENABLE ROW LEVEL SECURITY;
+```
+
+**Purpose**: Audit trail of who redeemed which codes and when.
+
+### Agents Table
+Stores information about study agents/tutors.
+
+```sql
+CREATE TABLE public.agents (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  mobile_number TEXT,
+  contact TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE public.agents ENABLE ROW LEVEL SECURITY;
+```
+
+**Purpose**: Admin-managed list of agents who can sell access codes.
+
+### Payment Requests Table
+Tracks payment requests from students.
+
+```sql
+CREATE TABLE public.payment_requests (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_name TEXT,
+  student_email TEXT NOT NULL,
+  student_email_2 TEXT,
+  amount NUMERIC(10,2) NOT NULL,
+  status public.payment_status NOT NULL DEFAULT 'pending',
+  generated_code TEXT,
+  notes TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE public.payment_requests ENABLE ROW LEVEL SECURITY;
+```
+
+**Purpose**: Admin tracks payment status and generates codes upon approval.
+
+### Topic Sets & Cards Tables
+Content structure for study materials.
+
+```sql
+CREATE TABLE public.topic_sets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title TEXT NOT NULL,
+  description TEXT,
+  order_index INT NOT NULL DEFAULT 0,
+  free_card_limit INT NOT NULL DEFAULT 5,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE public.topic_sets ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE public.cards (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  topic_set_id UUID NOT NULL REFERENCES public.topic_sets(id) ON DELETE CASCADE,
+  question TEXT NOT NULL,
+  answer TEXT NOT NULL,
+  order_index INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE public.cards ENABLE ROW LEVEL SECURITY;
+```
+
+### Support Tickets Table
+Customer support tickets.
+
+```sql
+CREATE TABLE public.support_tickets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+  user_email TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  message TEXT NOT NULL,
+  status public.ticket_status NOT NULL DEFAULT 'open',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE public.support_tickets ENABLE ROW LEVEL SECURITY;
+```
+
+---
+
+## 3. Functions (The Fix for Permission Issues)
+
+### ✅ has_role() - THE KEY FIX
+
+This function was throwing "permission denied" errors. It now has GRANT EXECUTE so everyone can call it:
+
+```sql
+CREATE OR REPLACE FUNCTION public.has_role(_user_id UUID, _role public.app_role)
+RETURNS BOOLEAN 
+LANGUAGE SQL 
+STABLE 
+SECURITY DEFINER 
+SET search_path = public AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.user_roles 
+    WHERE user_id = _user_id AND role = _role
+  )
+$$;
+
+-- THE FIX: Grant execute permission to authenticated and anonymous users
+GRANT EXECUTE ON FUNCTION public.has_role(UUID, public.app_role) TO authenticated, anon;
+```
+
+**Why This Was Broken**: The function didn't have execute permissions. Now everyone can call it.
+
+### admin_exists()
+
+Checks if any admin has been created yet.
+
+```sql
+CREATE OR REPLACE FUNCTION public.admin_exists()
+RETURNS BOOLEAN 
+LANGUAGE SQL 
+STABLE 
+SECURITY DEFINER 
+SET search_path = public AS $$
+  SELECT EXISTS(SELECT 1 FROM public.user_roles WHERE role = 'admin')
+$$;
+
+GRANT EXECUTE ON FUNCTION public.admin_exists() TO authenticated, anon;
+```
+
+### claim_admin()
+
+Allows the first user to claim admin role. Subsequent users cannot.
+
+```sql
+CREATE OR REPLACE FUNCTION public.claim_admin()
+RETURNS jsonb 
+LANGUAGE plpgsql 
+SECURITY DEFINER 
+SET search_path = public AS $$
+DECLARE
+  v_user_id UUID := auth.uid();
+  v_admin_count INT;
+BEGIN
+  IF v_user_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Not authenticated');
+  END IF;
+
+  SELECT COUNT(*) INTO v_admin_count FROM public.user_roles WHERE role = 'admin';
+
+  IF v_admin_count > 0 THEN
+    IF EXISTS (SELECT 1 FROM public.user_roles WHERE user_id = v_user_id AND role = 'admin') THEN
+      RETURN jsonb_build_object('success', true, 'message', 'Already admin');
+    ELSE
+      RETURN jsonb_build_object('success', false, 'error', 'Admin role already claimed by another user');
+    END IF;
+  END IF;
+
+  INSERT INTO public.user_roles (user_id, role) VALUES (v_user_id, 'admin')
+  ON CONFLICT DO NOTHING;
+
+  RETURN jsonb_build_object('success', true);
+END; $$;
+
+GRANT EXECUTE ON FUNCTION public.claim_admin() TO authenticated;
+```
+
+### redeem_access_code()
+
+Atomically redeems an access code for a user.
+
+```sql
+CREATE OR REPLACE FUNCTION public.redeem_access_code(_code TEXT)
+RETURNS JSONB 
+LANGUAGE plpgsql 
+SECURITY DEFINER 
+SET search_path = public AS $$
+DECLARE
+  v_code public.access_codes%ROWTYPE;
+  v_user_id UUID := auth.uid();
+  v_email TEXT;
+BEGIN
+  IF v_user_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Not authenticated');
+  END IF;
+
+  SELECT email INTO v_email FROM public.profiles WHERE id = v_user_id;
+
+  SELECT * INTO v_code FROM public.access_codes WHERE code = _code FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Invalid code');
+  END IF;
+
+  IF v_code.expires_at IS NOT NULL AND v_code.expires_at < now() THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Code has expired');
+  END IF;
+
+  IF v_code.used_seats >= v_code.total_seats THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Code already fully used');
+  END IF;
+
+  IF array_length(v_code.assigned_emails, 1) > 0 AND NOT (v_email = ANY(v_code.assigned_emails)) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Code not assigned to your account');
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM public.access_code_usage WHERE code_id = v_code.id AND user_id = v_user_id) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Already redeemed by you');
+  END IF;
+
+  INSERT INTO public.access_code_usage (code_id, user_id, user_email) VALUES (v_code.id, v_user_id, v_email);
+  UPDATE public.access_codes SET used_seats = used_seats + 1 WHERE id = v_code.id;
+  UPDATE public.profiles SET access_level = 'full' WHERE id = v_user_id;
+
+  RETURN jsonb_build_object('success', true);
+END; $$;
+
+GRANT EXECUTE ON FUNCTION public.redeem_access_code(TEXT) TO authenticated;
+```
+
+### handle_new_user() - Trigger
+
+Automatically creates a profile and assigns 'user' role when someone signs up.
+
+```sql
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER 
+LANGUAGE plpgsql 
+SECURITY DEFINER 
+SET search_path = public AS $$
+BEGIN
+  INSERT INTO public.profiles (id, email, full_name)
+  VALUES (NEW.id, NEW.email, COALESCE(NEW.raw_user_meta_data->>'full_name', ''));
+  
+  INSERT INTO public.user_roles (user_id, role) VALUES (NEW.id, 'user');
+  
+  RETURN NEW;
+END; $$;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW 
+  EXECUTE FUNCTION public.handle_new_user();
+```
+
+---
+
+## 4. Row-Level Security (RLS) Policies
+
+### Profiles Policies
+
+```sql
+-- Users can view their own profile
+CREATE POLICY "Users view own profile" ON public.profiles 
+FOR SELECT 
+USING (auth.uid() = id OR public.has_role(auth.uid(), 'admin'));
+
+-- Users can update their own profile
+CREATE POLICY "Users update own profile" ON public.profiles 
+FOR UPDATE 
+USING (auth.uid() = id);
+
+-- Admins can update any profile
+CREATE POLICY "Admins update any profile" ON public.profiles 
+FOR UPDATE 
+USING (public.has_role(auth.uid(), 'admin'));
+
+-- Users can only insert their own profile (handled by trigger)
+CREATE POLICY "Insert own profile" ON public.profiles 
+FOR INSERT 
+WITH CHECK (auth.uid() = id);
+```
+
+### User Roles Policies
+
+```sql
+-- Users see own roles, admins see all
+CREATE POLICY "Users view own roles" ON public.user_roles 
+FOR SELECT 
+USING (auth.uid() = user_id OR public.has_role(auth.uid(), 'admin'));
+
+-- Only admins can manage roles
+CREATE POLICY "Admins manage roles" ON public.user_roles 
+FOR ALL 
+USING (public.has_role(auth.uid(), 'admin'));
+```
+
+### Access Requests Policies (FIXED)
+
+```sql
+-- Users can create their own access requests
+CREATE POLICY "Users create access requests" ON public.access_requests 
+FOR INSERT 
+WITH CHECK (auth.uid() = user_id);
+
+-- Users view own requests
+CREATE POLICY "Users view own access requests" ON public.access_requests 
+FOR SELECT 
+USING (auth.uid() = user_id);
+
+-- ✅ FIXED: Admins can see and manage ALL access requests
+CREATE POLICY "Admins manage access requests" ON public.access_requests 
+FOR ALL 
+USING (public.has_role(auth.uid(), 'admin'));
+```
+
+### Agents Policies
+
+```sql
+-- Only admins can manage agents
+CREATE POLICY "Admins manage agents" ON public.agents 
+FOR ALL 
+USING (public.has_role(auth.uid(), 'admin'));
+```
+
+### Access Codes Policies
+
+```sql
+-- Only admins can manage access codes
+CREATE POLICY "Admins manage codes" ON public.access_codes 
+FOR ALL 
+USING (public.has_role(auth.uid(), 'admin'));
+```
+
+### Payment Requests Policies
+
+```sql
+-- Only admins can manage payment requests
+CREATE POLICY "Admins manage payments" ON public.payment_requests 
+FOR ALL 
+USING (public.has_role(auth.uid(), 'admin'));
+```
+
+### Topic Sets & Cards Policies
+
+```sql
+-- All authenticated users can read topic sets and cards
+CREATE POLICY "Authenticated read topic sets" ON public.topic_sets 
+FOR SELECT 
+TO authenticated 
+USING (true);
+
+CREATE POLICY "Authenticated read cards" ON public.cards 
+FOR SELECT 
+TO authenticated 
+USING (true);
+
+-- Only admins can manage content
+CREATE POLICY "Admins manage topic sets" ON public.topic_sets 
+FOR ALL 
+USING (public.has_role(auth.uid(), 'admin'));
+
+CREATE POLICY "Admins manage cards" ON public.cards 
+FOR ALL 
+USING (public.has_role(auth.uid(), 'admin'));
+```
+
+---
+
+## 5. How Admins Can Manage Everything
+
+Once an admin is authenticated, they can:
+
+### View Access Requests
+```sql
+SELECT * FROM access_requests 
+ORDER BY created_at DESC;
+```
+
+### Add New Agents
+```sql
+INSERT INTO agents (name, mobile_number, contact) 
+VALUES ('Agent Name', '+1234567890', 'contact@email.com');
+```
+
+### Create Access Codes
+```sql
+INSERT INTO access_codes (code, total_seats, amount, agent_name, assigned_emails)
+VALUES ('POWER2024', 10, 50.00, 'Agent Name', ARRAY['student@email.com']);
+```
+
+### Manage Users
+```sql
+UPDATE profiles 
+SET access_level = 'full' 
+WHERE id = '<user_uuid>';
+```
+
+---
+
+## 6. Environment Variables Required
+
+```
+VITE_SUPABASE_URL=https://jvivfauzkhqmrahcwtvh.supabase.co
+VITE_SUPABASE_PUBLISHABLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+---
+
+## Summary of Fixes
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| "Permission Denied for has_role" | Function lacked GRANT EXECUTE | Added GRANT EXECUTE to authenticated, anon |
+| Admin can't see access requests | RLS policy was too restrictive | Added "Admins manage access requests" ALL policy |
+| Admin can't add agents | RLS policy was missing | Added "Admins manage agents" policy |
+| New users not getting profiles | No trigger for auth signup | Created handle_new_user() trigger |
+| Admin can't be created | No way to claim admin role | Created claim_admin() function |
+
+All issues have been fixed and the admin dashboard is now fully functional! ✅
