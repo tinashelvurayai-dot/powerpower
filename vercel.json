@@ -1,16 +1,10 @@
-{
-  "buildCommand": "pnpm build",
-  "devCommand": "pnpm dev",
-  "installCommand": "pnpm install",
-  "framework": "vite",
-  "outputDirectory": "dist",
-  "env": {
-    "VITE_SUPABASE_URL": {
-      "required": true
-    },
-    "VITE_SUPABASE_ANON_KEY": {
-      "required": true
-    }
-  }
-}
+# Supabase Configuration
+# Get these values from your Supabase project settings
+NEXT_PUBLIC_SUPABASE_URL=https://your-project-id.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key-here
+
+# Note: For production, also ensure these are set in your Vercel project:
+# - Settings → Environment Variables
+# - Add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY
+
 
